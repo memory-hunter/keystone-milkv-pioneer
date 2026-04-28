@@ -137,10 +137,11 @@ void sm_print_cert() {
 }
 
 void sm_init(bool cold_boot) {
+  unsigned long hartid = csr_read(mhartid);
   // initialize SMM
   if (cold_boot) {
     /* only the cold-booting hart will execute these */
-    sbi_printf("[SM] Initializing ... hart [%lx]\n", csr_read(mhartid));
+    sbi_printf("[SM] Initializing ... hart [%lx]\n", hartid);
 
     sbi_ecall_register_extension(&ecall_keystone_enclave);
 
@@ -177,23 +178,29 @@ void sm_init(bool cold_boot) {
   while (!sm_init_done) {
     mb();
   }
-
-  /* below are executed by all harts */
-  pmp_init();
-  pmp_set_keystone(sm_region_id, PMP_NO_PERM);
-  pmp_set_keystone(os_region_id, PMP_ALL_PERM);
+  sbi_printf("[SM] warm A hart %lx\n", hartid);
+  /* DIAGNOSTIC: only cold hart runs PMP setup; warm harts use OpenSBI default PMP */
+  if (cold_boot) {
+    pmp_init();
+    sbi_printf("[SM] warm B hart %lx\n", hartid);
+    pmp_set_keystone(sm_region_id, PMP_NO_PERM);
+    sbi_printf("[SM] warm C hart %lx\n", hartid);
+    pmp_set_keystone(os_region_id, PMP_ALL_PERM);
+  }
+  sbi_printf("[SM] warm D hart %lx\n", hartid);
 
   /* Fire platform specific global init */
   if (platform_init_global() != SBI_ERR_SM_ENCLAVE_SUCCESS) {
     sbi_printf("[SM] platform global init fatal error");
     sbi_hart_hang();
   }
+  sbi_printf("[SM] warm done hart %lx\n", hartid);
 
   sbi_printf("[SM] Keystone security monitor has been initialized!\n");
 
   sm_print_hash();
 
   // TODO: remove for debug
-  sm_print_cert();
+//  sm_print_cert();
   return;
 }

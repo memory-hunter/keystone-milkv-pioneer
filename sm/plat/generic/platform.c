@@ -113,7 +113,8 @@ unsigned long fw_platform_init(unsigned long arg0, unsigned long arg1,
     generic_hart_index2id[hart_count++] = hartid;
   }
 
-  platform.hart_count = hart_count;
+  /* Pinned to compile-time value to match scratch alloc; do not rewrite. */
+  /* platform.hart_count = hart_count; */
 
   platform_has_mlevel_imsic = fdt_check_imsic_mlevel(fdt);
 
@@ -295,5 +296,5 @@ struct sbi_platform platform = {
     .features = SBI_PLATFORM_DEFAULT_FEATURES,
     .hart_count = SBI_HARTMASK_MAX_BITS,
     .hart_index2id = generic_hart_index2id,
-    .hart_stack_size = SBI_PLATFORM_DEFAULT_HART_STACK_SIZE,
+    .hart_stack_size = 16384,
     .platform_ops_addr = (unsigned long)&platform_ops};
