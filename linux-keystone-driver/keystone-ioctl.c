@@ -7,7 +7,44 @@
 #include "keystone_user.h"
 #include <asm/sbi.h>
 #include <linux/string.h>
+#include <linux/compiler.h>
+#include <linux/build_bug.h>
+#include <linux/irqflags.h>
+
+struct edge_return {
+  unsigned long call_status;
+  size_t        call_ret_offset;
+  size_t        call_ret_size;
+};
+struct edge_call {
+  unsigned long     call_id;
+  size_t             call_arg_offset;
+  size_t             call_arg_size;
+  struct edge_return return_data;
+};
+
+
 #include <linux/uaccess.h>
+
+#define TH_L1D_IALL     __asm__ volatile(".long 0x20000b"  ::: "memory")
+
+#define TH_L1D_CIALL    __asm__ volatile(".long 0x30000b"  ::: "memory")
+#define TH_L2_CIALL     __asm__ volatile(".long 0x170000b" ::: "memory")
+
+#define TH_SYNC_S       __asm__ volatile(".long 0x190000b" ::: "memory")
+
+#define TH_L1D_CIPA_A0     __asm__ volatile(".long 0x2b5000b" ::: "memory")
+#define TH_L1D_CIVA_A0     __asm__ volatile(".long 0x275000b" ::: "memory")
+
+#define TH_FLUSH_ALL \
+    TH_SYNC_S;       \
+    TH_L1D_CIALL;    \
+    TH_SYNC_S;       \
+    TH_L2_CIALL;     \
+    TH_SYNC_S;
+
+#define XTCMO_OCALL_FLUSH_ALL   69420UL
+#define XTCMO_OCALL_L1D_IALL    6767UL
 
 int __keystone_destroy_enclave(unsigned int ueid);
 void __enclave_info(struct enclave *enclave);
@@ -211,6 +248,13 @@ int __keystone_destroy_enclave(unsigned int ueid) {
 
 int keystone_resume_enclave(unsigned long data) {
   struct sbiret ret;
+  ret.error = 0;
+  ret.value = 0;
+  TH_FLUSH_ALL;
+  unsigned long flags;
+  local_irq_save(flags);
+  // register unsigned long rs1 asm("a0") = (uintptr_t)&ret;
+  // TH_L1D_CIVA_A0;
   struct keystone_ioctl_run_enclave *arg =
       (struct keystone_ioctl_run_enclave *)data;
   unsigned long ueid = arg->eid;
@@ -227,11 +271,26 @@ int keystone_resume_enclave(unsigned long data) {
     return -EINVAL;
   }
 
-  ret = sbi_sm_resume_enclave(enclave->eid);
+  struct edge_call *ec;
+  unsigned long id;
 
+  ec = (struct edge_call *)enclave->utm->ptr;
+  id = ec->call_id;
+
+  // rs1 = (uintptr_t)&enclave;
+  // TH_L1D_CIVA_A0;
+  TH_FLUSH_ALL; // wbinvd
+  ret = sbi_sm_resume_enclave(enclave->eid);
+  if (id == XTCMO_OCALL_L1D_IALL) {
+    TH_SYNC_S;
+    TH_L1D_IALL; // invd l1d
+    TH_SYNC_S;
+  }
+  
   arg->error = ret.error;
   arg->value = ret.value;
-
+  
+  local_irq_restore(flags);
   return 0;
 }
 

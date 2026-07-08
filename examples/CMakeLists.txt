@@ -41,6 +41,7 @@ set(OTHER_EXAMPLES
   hello
   hello-native
   tests
+  cache-cntr
 )
 
 # Selection logic
