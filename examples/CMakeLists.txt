@@ -41,6 +41,8 @@ set(OTHER_EXAMPLES
   hello
   hello-native
   tests
+  rdcycle-rt
+  rdcycle-direct
 )
 
 # Selection logic
