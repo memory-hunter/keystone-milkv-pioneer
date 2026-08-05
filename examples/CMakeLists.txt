@@ -42,6 +42,8 @@ set(OTHER_EXAMPLES
   hello-native
   tests
   cache-cntr
+  rdcycle-rt
+  rdcycle-direct
 )
 
 # Selection logic
