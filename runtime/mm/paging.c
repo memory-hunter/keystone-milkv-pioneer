@@ -208,7 +208,7 @@ uintptr_t paging_evict_and_free_one(uintptr_t swap_va)
 
   /* invalidate target PTE */
   *target_pte = pte_create_invalid(ppn(__paging_pa(dest_va)),
-      *target_pte & PTE_FLAG_MASK);
+      *target_pte & PTE_ATTR_MASK);
   paging_dec_user_page();
 
   tlb_flush();
@@ -254,7 +254,7 @@ void paging_handle_page_fault(struct encl_ctx* ctx)
 
   assert(*entry & PTE_U);
   /* validate the entry */
-  *entry = pte_create(ppn(frame), *entry & PTE_FLAG_MASK);
+  *entry = pte_create(ppn(frame), *entry & PTE_ATTR_MASK);
   paging_inc_user_page();
 
   return;

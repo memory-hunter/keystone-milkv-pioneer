@@ -33,14 +33,14 @@ extern uintptr_t shared_buffer_size;
 
 #endif
 
-static inline pte pte_create(uintptr_t ppn, int type)
+static inline pte pte_create(uintptr_t ppn, uintptr_t type)
 {
-  return (pte)((ppn << PTE_PPN_SHIFT) | PTE_V | (type & PTE_FLAG_MASK) );
+  return (pte)((ppn << PTE_PPN_SHIFT) | PTE_V | (type & PTE_ATTR_MASK) );
 }
 
-static inline pte pte_create_invalid(uintptr_t ppn, int type)
+static inline pte pte_create_invalid(uintptr_t ppn, uintptr_t type)
 {
-  return (pte)((ppn << PTE_PPN_SHIFT) | (type & PTE_FLAG_MASK & ~PTE_V));
+  return (pte)((ppn << PTE_PPN_SHIFT) | (type & PTE_ATTR_MASK & ~PTE_V));
 }
 
 static inline pte ptd_create(uintptr_t ppn)

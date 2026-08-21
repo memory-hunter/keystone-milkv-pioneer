@@ -77,7 +77,7 @@ map_page(uintptr_t vpn, uintptr_t ppn, int flags)
     return -1;
   }
 
-  *pte = pte_create(ppn, PTE_D | PTE_A | PTE_V | flags);
+  *pte = pte_create(ppn, PTE_D | PTE_A | PTE_V | flags | PTE_MT_ATTR);
   return 1;
 }
 
@@ -101,7 +101,7 @@ alloc_page(uintptr_t vpn, int flags)
   page = spa_get_zero();
   assert(page);
 
-  *pte = pte_create(ppn(__pa(page)), PTE_D | PTE_A | PTE_V | flags);
+  *pte = pte_create(ppn(__pa(page)), PTE_D | PTE_A | PTE_V | flags | PTE_MT_ATTR);
 #ifdef USE_PAGING
   paging_inc_user_page();
 #endif
@@ -119,7 +119,7 @@ realloc_page(uintptr_t vpn, int flags)
     return 0;
 
   if(*pte & PTE_V) {
-    *pte = pte_create(pte_ppn(*pte), flags);
+    *pte = pte_create(pte_ppn(*pte), flags | PTE_MT_ATTR);
     return __va(*pte << RISCV_PAGE_BITS);
   }
 
@@ -251,7 +251,7 @@ __map_with_reserved_page_table_32(uintptr_t dram_base,
   {
         leaf_pt[RISCV_GET_PT_INDEX(ptr + offset, leaf_level)] =
         pte_create(ppn(dram_base + offset),
-                 PTE_R | PTE_W | PTE_X | PTE_A | PTE_D);
+                 PTE_R | PTE_W | PTE_X | PTE_A | PTE_D | PTE_MT_ATTR);
   }
 
 }
@@ -292,7 +292,7 @@ __map_with_reserved_page_table_64(uintptr_t dram_base,
   {
     leaf_pt[RISCV_GET_PT_INDEX(ptr + offset, leaf_level)] =
       pte_create(ppn(dram_base + offset),
-          PTE_R | PTE_W | PTE_X | PTE_A | PTE_D);
+          PTE_R | PTE_W | PTE_X | PTE_A | PTE_D | PTE_MT_ATTR);
   }
 
 }
@@ -316,4 +316,3 @@ map_with_reserved_page_table(uintptr_t dram_base,
     __map_with_reserved_page_table_32(dram_base, dram_size, ptr, l2_pt);
   #endif
 }
-

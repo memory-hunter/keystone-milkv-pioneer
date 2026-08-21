@@ -62,7 +62,24 @@
 #define PTE_G 0x020  // Global
 #define PTE_A 0x040  // Accessed
 #define PTE_D 0x080  // Dirty
+#define _PAGE_PMA_THEAD		((1UL << 62) | (1UL << 61) | (1UL << 60))
+#define _PAGE_NOCACHE_THEAD	((1UL << 61) | (1UL << 60))
+#define _PAGE_IO_THEAD		((1UL << 63) | (1UL << 60))
+#define _PAGE_MTMASK_THEAD	(_PAGE_PMA_THEAD | _PAGE_IO_THEAD | (1UL << 59))
 #define PTE_FLAG_MASK 0x3ff
+
+// Enables Xtheadmae support to get the enclave pages cacheable properly
+#define KEYSTONE_XUANTIE_PBMT_QUIRK 1
+
+#if KEYSTONE_XUANTIE_PBMT_QUIRK
+#define PTE_MT_ATTR _PAGE_PMA_THEAD
+#else
+#define PTE_MT_ATTR 0
+#endif
+
+/* PTE bits that pte_create() is allowed to pass through: the standard
+ * low flag bits plus (when enabled) the T-Head high memory-type bits. */
+#define PTE_ATTR_MASK (PTE_FLAG_MASK | _PAGE_MTMASK_THEAD)
 #define PTE_PPN_SHIFT 10
 
 #ifndef __PREPROCESSING__
