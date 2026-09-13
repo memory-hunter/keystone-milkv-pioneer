@@ -56,6 +56,7 @@ struct enclave {
   struct utm *utm;
   struct epm *epm;
   bool is_init;
+  bool has_run; // set once sbi_sm_run_enclave() has been issued (single-step)
 };
 
 // global debug functions

@@ -34,7 +34,7 @@ else()
   set(ABI lp64d)
 endif()
 
-set(ISA rv${BITS}imafdc)
+set(ISA rv${BITS}imafdc_xtheadcmo_xtheadsync)
 set(confdir ${CMAKE_SOURCE_DIR}/overlays/keystone/configs)
 set(patchdir ${CMAKE_SOURCE_DIR}/overlays/keystone/patches)
 set(cross_compile riscv${BITS}-buildroot-linux-gnu-)
