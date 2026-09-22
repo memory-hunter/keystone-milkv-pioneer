@@ -8,10 +8,6 @@
 #define OCALL_PRINT_BUFFER 1
 #define OCALL_PRINT_VALUE 2
 
-#ifndef ITERS
-#define ITERS 50000000UL
-#endif
-
 static unsigned long
 ocall_print_buffer(const char *str, size_t len)
 {
@@ -44,22 +40,12 @@ static inline void fence(void)
 int main(void)
 {
   volatile int dummy = 0;
-  //volatile int old = 0;
   ocall_print_value((uintptr_t)&dummy);
   while (1)
   {
     fence();
     dummy++;
     ocall_print_value(dummy);
-    // if (dummy <= old)
-    // {
-    //   PRINT_STR("Invalidated successfully because old value is bigger than dummy");
-    //   ocall_print_value(old);
-    //   PRINT_STR("VS");
-    //   ocall_print_value(dummy);
-    //   EAPP_RETURN(0);
-    // }
-    // old = dummy;
     fence();
   }
 
