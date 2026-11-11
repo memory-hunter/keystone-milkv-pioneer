@@ -1,316 +1,278 @@
-/* Interactive single-stepper for the keystone driver's step_mode gate.
- *
- * step_mode pauses the enclave's own natural run/resume calls (issued by
- * its own host loader) at every timer-forced interruption, and blocks
- * inside the kernel until this tool releases one token. There is no
- * separate ioctl call racing the enclave's loader -- this tool only ever
- * writes tokens; the enclave's own process is what's actually blocked.
- *
- * At each pause you choose:
- *   Enter      -- just continue (step_go)
- *   i + Enter  -- invalidate strike_target_pa (drop dirty data), then
- *                 continue (ipa)
- *   c + Enter  -- clean+invalidate strike_target_pa (write back current
- *                 value first, then invalidate), then continue
- *                 (cipa_go) -- use this to pin down which value becomes
- *                 visible instead of reverting to the stale one
- *   q + Enter  -- quit: releases whatever's currently blocked and resets
- *                 strike_target_eid to -1, so nothing keeps getting
- *                 interrupted after you leave. Same cleanup runs on
- *                 Ctrl-C.
- *
- * Usage:
- *   ./keystone-step --eid <eid> [--delta <ticks>] [--pa <pa>]
- *
- *   --eid <eid>     driver-side enclave id (from dmesg -- see
- *                   "created enclave, driver eid = N" in keystone-ioctl.c)
- *   --delta <ticks> timer ticks per step (optional -- leaves whatever's
- *                   currently set if omitted)
- *   --pa <pa>       physical address for the i/c gates (optional; hex
- *                   0x... or decimal)
- *
- * You can launch this *before* the target enclave exists: it sets
- * strike_target_eid first, then its own first step_go write is exactly
- * what releases that target's very first pause the moment it calls
- * RUN_ENCLAVE. Until the target shows up, that first write times out
- * (5s, from the kernel side) and this tool just retries it, printing a
- * wait message each time -- so start this first, then launch the .ke in
- * another terminal.
- *
- * Each step's result (error/value) is read back directly from sysfs
- * (last_error/last_pc) right after the write that caused it -- no dmesg
- * scraping needed, though the driver can still mirror it to dmesg too
- * if you turn that on:
- *   echo 1 > /sys/module/keystone_driver/parameters/step_log_dmesg
- *
- * Build:  <riscv64 cross-gcc> -o keystone-step step.c
- */
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-/* the driver's idr allocates real ueids starting at this offset
- * (ENCLAVE_IDR_MIN in keystone-enclave.c) -- so a user-facing --eid of 0
- * is actually driver ueid ENCLAVE_IDR_BASE, and so on. */
+#include "../keystone_step_rec.h"
+
 #define ENCLAVE_IDR_BASE 0x1000
 
-#define PARAM_DIR        "/sys/module/keystone_driver/parameters/"
-#define STEP_GO_PATH     PARAM_DIR "step_go"
-#define IPA_PATH         PARAM_DIR "ipa"
-#define CIPA_GO_PATH     PARAM_DIR "cipa_go"
-#define LAST_PC_PATH     PARAM_DIR "last_pc"
-#define LAST_ERROR_PATH  PARAM_DIR "last_error"
-
-#define SBI_ERR_SM_ENCLAVE_SUCCESS          0
-#define SBI_ERR_SM_ENCLAVE_UNKNOWN_ERROR    100000
-#define SBI_ERR_SM_ENCLAVE_INVALID_ID       100001
-#define SBI_ERR_SM_ENCLAVE_INTERRUPTED      100002
-#define SBI_ERR_SM_ENCLAVE_PMP_FAILURE      100003
-#define SBI_ERR_SM_ENCLAVE_NOT_RUNNABLE     100004
-#define SBI_ERR_SM_ENCLAVE_NOT_DESTROYABLE  100005
-#define SBI_ERR_SM_ENCLAVE_REGION_OVERLAPS  100006
-#define SBI_ERR_SM_ENCLAVE_NOT_ACCESSIBLE   100007
-#define SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT 100008
-#define SBI_ERR_SM_ENCLAVE_NOT_RUNNING      100009
-#define SBI_ERR_SM_ENCLAVE_NOT_RESUMABLE    100010
-#define SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST   100011
-#define SBI_ERR_SM_ENCLAVE_NOT_INITIALIZED  100012
-#define SBI_ERR_SM_ENCLAVE_NO_FREE_RESOURCE 100013
-#define SBI_ERR_SM_ENCLAVE_SBI_PROHIBITED   100014
-#define SBI_ERR_SM_ENCLAVE_ILLEGAL_PTE      100015
-#define SBI_ERR_SM_ENCLAVE_NOT_FRESH        100016
-
-static const char *
-error_name(long err)
-{
-  switch (err) {
-  case SBI_ERR_SM_ENCLAVE_SUCCESS:          return "SUCCESS";
-  case SBI_ERR_SM_ENCLAVE_UNKNOWN_ERROR:    return "UNKNOWN_ERROR";
-  case SBI_ERR_SM_ENCLAVE_INVALID_ID:       return "INVALID_ID";
-  case SBI_ERR_SM_ENCLAVE_INTERRUPTED:      return "INTERRUPTED";
-  case SBI_ERR_SM_ENCLAVE_PMP_FAILURE:      return "PMP_FAILURE";
-  case SBI_ERR_SM_ENCLAVE_NOT_RUNNABLE:     return "NOT_RUNNABLE";
-  case SBI_ERR_SM_ENCLAVE_NOT_DESTROYABLE:  return "NOT_DESTROYABLE";
-  case SBI_ERR_SM_ENCLAVE_REGION_OVERLAPS:  return "REGION_OVERLAPS";
-  case SBI_ERR_SM_ENCLAVE_NOT_ACCESSIBLE:   return "NOT_ACCESSIBLE";
-  case SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT: return "ILLEGAL_ARGUMENT";
-  case SBI_ERR_SM_ENCLAVE_NOT_RUNNING:      return "NOT_RUNNING";
-  case SBI_ERR_SM_ENCLAVE_NOT_RESUMABLE:    return "NOT_RESUMABLE";
-  case SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST:   return "EDGE_CALL_HOST";
-  case SBI_ERR_SM_ENCLAVE_NOT_INITIALIZED:  return "NOT_INITIALIZED";
-  case SBI_ERR_SM_ENCLAVE_NO_FREE_RESOURCE: return "NO_FREE_RESOURCE";
-  case SBI_ERR_SM_ENCLAVE_SBI_PROHIBITED:   return "SBI_PROHIBITED";
-  case SBI_ERR_SM_ENCLAVE_ILLEGAL_PTE:      return "ILLEGAL_PTE";
-  case SBI_ERR_SM_ENCLAVE_NOT_FRESH:        return "NOT_FRESH";
-  default:                                  return "?";
-  }
-}
+#define PARAM_DIR "/sys/module/keystone_driver/parameters/"
+#define LOG_DEV "/dev/keystone_step"
 
 static int
-write_param(const char *path, unsigned long value)
+write_param(const char *name, long value)
 {
+  char path[256];
+  snprintf(path, sizeof(path), PARAM_DIR "%s", name);
+
   FILE *f = fopen(path, "w");
   if (!f) {
-    perror(path);
-    return -1;
-  }
-  int rc = fprintf(f, "%lu\n", value) < 0 ? -1 : 0;
-  fclose(f);
-  return rc;
-}
-
-static long
-read_param(const char *path)
-{
-  FILE *f = fopen(path, "r");
-  if (!f) {
-    perror(path);
-    return -1;
-  }
-  long v = -1;
-  int n = fscanf(f, "%ld", &v);
-  fclose(f);
-  return n == 1 ? v : -1;
-}
-
-/* returns 0 on success, -1 on real error, 1 on timeout (retryable --
- * usually means the target hasn't reached its first RUN_ENCLAVE yet).
- * Uses a raw fd + write(2), not stdio, so errno from the failing write
- * is read directly -- no risk of fclose() or another libc call
- * clobbering it first. */
-static int
-write_gate(const char *path)
-{
-  int fd = open(path, O_WRONLY);
-  if (fd < 0) {
     perror(path);
     fprintf(stderr, "(is the keystone-driver module loaded? are you root?)\n");
     return -1;
   }
-
-  int rc = 0;
-  if (write(fd, "1\n", 2) != 2)
-    rc = (errno == ETIMEDOUT) ? 1 : -1;
-
-  close(fd);
+  int rc = fprintf(f, "%ld\n", value) < 0 ? -1 : 0;
+  if (fclose(f))
+    rc = -1;
+  if (rc)
+    fprintf(stderr, "%s: write failed: %s\n", path, strerror(errno));
   return rc;
 }
 
 static void
-usage(const char *argv0)
+disarm(void)
 {
-  fprintf(stderr, "usage: %s --eid <eid> [--delta <ticks>] [--pa <pa>]\n", argv0);
+  write_param("strike_target_eid", -1);
+  write_param("log_pc", 0);
 }
 
-/* Called on both 'q' and Ctrl-C. Raw open/write/close (not stdio) so
- * it's safe to call from the signal handler too. Two steps:
- *   1. release whatever's currently blocked in step_wait_for_token()
- *      (best-effort -- if nothing's waiting, this just times out after
- *      5s with no harm done)
- *   2. reset strike_target_eid to -1, which the driver now re-checks
- *      live on every loop iteration (not just once at entry), so this
- *      takes effect immediately even for that same in-flight call --
- *      nothing keeps getting interrupted after this returns.
- */
-static void
-release_and_reset(void)
+static int
+read_param(const char *name, unsigned long *value)
 {
-  int fd = open(STEP_GO_PATH, O_WRONLY);
-  if (fd >= 0) {
-    write(fd, "1\n", 2);
-    close(fd);
-  }
+  char path[256];
+  snprintf(path, sizeof(path), PARAM_DIR "%s", name);
 
-  fd = open(PARAM_DIR "strike_target_eid", O_WRONLY);
-  if (fd >= 0) {
-    write(fd, "-1\n", 3);
-    close(fd);
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return -1;
+  int n = fscanf(f, "%lu", value);
+  fclose(f);
+  return n == 1 ? 0 : -1;
+}
+
+#define ERROR_INTERRUPTED 100002
+#define ERROR_EDGE_CALL_HOST 100011
+
+static unsigned long step_index;
+static unsigned long previous_pc;
+static int has_previous_pc;
+
+static const char *
+classify_step(unsigned long pc)
+{
+  const char *kind = "-";
+
+  if (has_previous_pc) {
+    long diff = (long)(pc - previous_pc);
+    if (diff == 0)
+      kind = "zero";
+    else if (diff > 0 && diff <= 4)
+      kind = "single";
+    else
+      kind = "multi";
+  }
+  previous_pc = pc;
+  has_previous_pc = 1;
+  return kind;
+}
+
+static int
+print_record(const struct step_rec *rec)
+{
+  switch (rec->kind) {
+  case STEP_REC_START:
+    step_index = 0;
+    has_previous_pc = 0;
+    fprintf(stdout, "start ueid=0x%llx\n", (unsigned long long)rec->val);
+    return 0;
+  case STEP_REC_STEP:
+    fprintf(stdout, "step=%lu pc=0x%016llx err=%d %s\n", step_index++,
+            (unsigned long long)rec->val, ERROR_INTERRUPTED,
+            classify_step((unsigned long)rec->val));
+    return 0;
+  case STEP_REC_END:
+    fprintf(stdout, "end err=%u value=0x%llx\n", rec->err, (unsigned long long)rec->val);
+    return rec->err != ERROR_INTERRUPTED && rec->err != ERROR_EDGE_CALL_HOST;
+  default:
+    return 0;
   }
 }
 
+static int
+drain_log(int fd, int wait_ms)
+{
+  static struct step_rec records[4096];
+  struct pollfd pfd = { .fd = fd, .events = POLLIN };
+  int finished = 0;
+
+  for (;;) {
+    int pr = poll(&pfd, 1, wait_ms);
+    if (pr < 0) {
+      if (errno == EINTR)
+        break;
+      return -1;
+    }
+    if (pr == 0)
+      break;
+
+    ssize_t n = read(fd, records, sizeof(records));
+    if (n < 0) {
+      if (errno == EAGAIN || errno == EINTR)
+        continue;
+      return -1;
+    }
+
+    for (size_t i = 0; i < (size_t)n / sizeof(records[0]); i++)
+      if (print_record(&records[i]))
+        finished = 1;
+
+    if (finished)
+      break;
+  }
+
+  if (fflush(stdout))
+    return -1;
+  return finished;
+}
+
+static volatile sig_atomic_t stop;
+
 static void
-sigint_handler(int sig)
+on_signal(int sig)
 {
   (void)sig;
-  release_and_reset();
-  _exit(1);
+  stop = 1;
+}
+
+static void
+usage(const char *program)
+{
+  fprintf(stderr,
+          "usage: %s --eid <enclave id|any> [--delta <ticks>] [--no-log]\n"
+          "          [--pa <physical address>] [--rip-start <addr> --rip-end <addr>]\n"
+          "       %s --off\n",
+          program, program);
 }
 
 int
 main(int argc, char **argv)
 {
-  long eid = -1, delta = -1;
+  long enclave_id = -1;
+  int any_enclave = 0;
+  long delta_ticks = -1;
   unsigned long pa = 0;
-  int pa_set = 0;
-
-  /* force line buffering regardless of whether stdout is a real tty --
-   * without this, output can sit in libc's buffer while we're blocked
-   * in write_gate()/fgets(), making it look like nothing happened. */
-  setvbuf(stdout, NULL, _IOLBF, 0);
-
-  signal(SIGINT, sigint_handler);
+  unsigned long rip_start = 0;
+  unsigned long rip_end = 0;
+  int has_pa = 0;
+  int has_rip_start = 0;
+  int has_rip_end = 0;
+  int log_pc = 1;
+  int off = 0;
 
   for (int i = 1; i < argc; i++) {
-    if (!strcmp(argv[i], "--eid") && i + 1 < argc)
-      eid = strtol(argv[++i], NULL, 0);
-    else if (!strcmp(argv[i], "--delta") && i + 1 < argc)
-      delta = strtol(argv[++i], NULL, 0);
-    else if (!strcmp(argv[i], "--pa") && i + 1 < argc) {
-      /* strtoul, not strtol -- physical addresses on this platform can
-       * have bit 63 set (e.g. 0xc0000001...), which overflows a signed
-       * long and silently clamps to LONG_MAX under strtol. */
-      pa = strtoul(argv[++i], NULL, 0);
-      pa_set = 1;
+    if (!strcmp(argv[i], "--eid") && i + 1 < argc) {
+      i++;
+      if (!strcmp(argv[i], "any"))
+        any_enclave = 1;
+      else
+        enclave_id = strtol(argv[i], NULL, 0);
     }
+    else if (!strcmp(argv[i], "--delta") && i + 1 < argc)
+      delta_ticks = strtol(argv[++i], NULL, 0);
+    else if (!strcmp(argv[i], "--pa") && i + 1 < argc) {
+      pa = strtoul(argv[++i], NULL, 0);
+      has_pa = 1;
+    } else if (!strcmp(argv[i], "--rip-start") && i + 1 < argc) {
+      rip_start = strtoul(argv[++i], NULL, 0);
+      has_rip_start = 1;
+    } else if (!strcmp(argv[i], "--rip-end") && i + 1 < argc) {
+      rip_end = strtoul(argv[++i], NULL, 0);
+      has_rip_end = 1;
+    } else if (!strcmp(argv[i], "--no-log"))
+      log_pc = 0;
+    else if (!strcmp(argv[i], "--off"))
+      off = 1;
     else {
       usage(argv[0]);
       return 1;
     }
   }
 
-  if (eid < 0) {
+  if (off) {
+    disarm();
+    return 0;
+  }
+
+  if ((enclave_id < 0 && !any_enclave) || has_rip_start != has_rip_end || (has_rip_start && !has_pa)) {
     usage(argv[0]);
     return 1;
   }
 
-  eid += ENCLAVE_IDR_BASE;
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = on_signal;
+  sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGTERM, &sa, NULL);
 
-  printf("keystone-step: targeting eid=%ld (driver ueid=%ld)\n", eid - ENCLAVE_IDR_BASE, eid);
-  if (write_param(PARAM_DIR "strike_target_eid", (unsigned long)eid))
-    return 1;
-  if (delta >= 0 && write_param(PARAM_DIR "strike_delta_ticks", (unsigned long)delta))
-    return 1;
-  if (pa_set && write_param(PARAM_DIR "strike_target_pa", pa))
-    return 1;
-  if (write_param(PARAM_DIR "step_mode", 1))
-    return 1;
+  long driver_enclave_id = any_enclave ? -2 : enclave_id + ENCLAVE_IDR_BASE;
 
-  printf("keystone-step:\n"
-         "  Enter      -- continue\n"
-         "  i + Enter  -- invalidate, then continue\n"
-         "  c + Enter  -- clean+invalidate, then continue\n"
-         "  q + Enter  -- quit (enclave stays paused)\n\n");
-
-  printf("keystone-step: waiting for eid=%ld to reach its first pause...\n", eid);
-
-  /* catch the first pause automatically -- don't wait on stdin for this
-   * one, since there's nothing to choose yet (no i/c/q makes sense
-   * before anything has actually paused). */
-  {
-    int rc;
-    do {
-      rc = write_gate(STEP_GO_PATH);
-      if (rc > 0)
-        printf("keystone-step: still waiting for eid=%ld...\n", eid);
-    } while (rc > 0);
-
-    if (rc < 0)
+  int log_fd = -1;
+  if (log_pc) {
+    log_fd = open(LOG_DEV, O_RDONLY | O_NONBLOCK);
+    if (log_fd < 0) {
+      perror(LOG_DEV);
       return 1;
-
-    long err = read_param(LAST_ERROR_PATH);
-    printf("keystone-step: parked at first step -- error=%ld (%s)\n",
-           err, error_name(err));
-    fflush(stdout);
-  }
-
-  char line[64];
-  unsigned long step_count = 1;
-
-  while (fgets(line, sizeof(line), stdin)) {
-    if (line[0] == 'q')
-      break;
-
-    const char *path = STEP_GO_PATH;
-    const char *action = "continue";
-    if (line[0] == 'i') {
-      path = IPA_PATH;
-      action = "invalidated";
-    } else if (line[0] == 'c') {
-      path = CIPA_GO_PATH;
-      action = "wrote back + invalidated";
     }
-
-    int rc;
-    do {
-      rc = write_gate(path);
-      if (rc > 0)
-        printf("keystone-step: still waiting for eid=%ld...\n", eid);
-    } while (rc > 0);
-
-    if (rc < 0)
-      break;
-
-    step_count++;
-    long err = read_param(LAST_ERROR_PATH);
-
-    printf("[step %5lu] %-25s error=%ld (%s)\n",
-           step_count, action, err, error_name(err));
-    fflush(stdout);
   }
 
-  return 0;
+  if ((delta_ticks >= 0 && write_param("strike_delta_ticks", delta_ticks)) ||
+      write_param("strike_target_pa", has_pa ? (long)pa : 0) ||
+      write_param("strike_rip_start", (long)rip_start) ||
+      write_param("strike_rip_end", (long)rip_end) ||
+      write_param("log_pc", log_pc) ||
+      write_param("strike_target_eid", driver_enclave_id)) {
+    disarm();
+    return 1;
+  }
+
+  fprintf(stderr,
+          "keystone-step: armed eid=%ld (driver ueid=%ld) delta=%ld pa=0x%lx rip=[0x%lx,0x%lx] log_pc=%d\n",
+          enclave_id, driver_enclave_id, delta_ticks, pa, rip_start, rip_end, log_pc);
+  fprintf(stderr, "keystone-step: waiting for the enclave to run; exits when it finishes, Ctrl-C to abort\n");
+
+  setvbuf(stdout, NULL, _IOFBF, 1 << 20);
+
+  int rc = 0;
+  while (!stop) {
+    if (log_fd < 0) {
+      pause();
+      continue;
+    }
+    int r = drain_log(log_fd, 200);
+    if (r < 0) {
+      perror("keystone-step: log");
+      rc = 1;
+      break;
+    }
+    if (r > 0) {
+      fprintf(stderr, "keystone-step: enclave finished\n");
+      break;
+    }
+  }
+
+  disarm();
+
+  if (log_fd >= 0) {
+    drain_log(log_fd, 0);
+    unsigned long dropped = 0;
+    if (!read_param("log_dropped", &dropped) && dropped)
+      fprintf(stderr, "keystone-step: %lu log lines dropped (log buffer overflow)\n", dropped);
+    close(log_fd);
+  }
+  return rc;
 }

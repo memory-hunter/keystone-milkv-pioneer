@@ -24,30 +24,60 @@ ocall_print_value(unsigned long val)
 
 #define PRINT_STR(s) ocall_print_buffer((s), sizeof(s))
 
-static inline uint64_t
-rdcycle(void)
-{
-  unsigned long v;
-  asm volatile("rdcycle %0" : "=r"(v));
-  return (uint64_t)v;
-}
-
 static inline void fence(void)
 {
   asm volatile("fence rw, rw" ::: "memory");
 }
 
+#define INC10 asm volatile("nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;");
+#define INC100 INC10 INC10 INC10 INC10 INC10 INC10 INC10 INC10 INC10 INC10
+#define INC1K INC100 INC100 INC100 INC100 INC100 INC100 INC100 INC100 INC100 INC100
+#define INC10K INC1K INC1K INC1K INC1K INC1K INC1K INC1K INC1K INC1K INC1K
+#define INC100K INC10K INC10K INC10K INC10K INC10K INC10K INC10K INC10K INC10K
+#define PADDING INC10K;\
+    INC1K;\
+    INC1K;\
+    INC1K;\
+    INC1K;\
+    INC1K;\
+    INC1K;\
+    INC100;\
+    INC100;\
+    INC100;\
+    INC10;\
+    INC10;\
+    asm volatile("nop; nop; nop;"); //0x10000 nops exactly
+
 int main(void)
 {
   volatile int dummy = 0;
-  ocall_print_value((uintptr_t)&dummy);
-  while (1)
-  {
-    fence();
-    dummy++;
-    ocall_print_value(dummy);
-    fence();
-  }
-
+  // ocall_print_value((uintptr_t)&dummy);
+  fence();
+  INC100K;
+  INC100K;
+  INC100K;
+  INC100K;
+  INC100K;
+  INC100K;
+  INC100K;
+  INC100K;
+  INC100K;
+  INC100K;
+  INC100K;
+  // PADDING;
+  // PADDING;
+  // PADDING;
+  // PADDING;
+  // PADDING;
+  // PADDING;
+  // PADDING;
+  // PADDING;
+  // while (1)
+  // {
+  //   INC100K;
+  //   INC100K;
+  // }
+  fence();
+  // ocall_print_value(dummy);
   EAPP_RETURN(0);
 }

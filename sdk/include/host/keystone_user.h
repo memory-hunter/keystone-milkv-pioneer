@@ -26,12 +26,6 @@
   _IOR(KEYSTONE_IOC_MAGIC, 0x06, struct keystone_ioctl_create_enclave)
 #define KEYSTONE_IOC_UTM_INIT \
   _IOR(KEYSTONE_IOC_MAGIC, 0x07, struct keystone_ioctl_create_enclave)
-/* runs the enclave for exactly one strike_delta_ticks slice and returns
- * immediately -- no internal auto-loop, regardless of stop reason. call
- * repeatedly to single-step. reuses the run/resume struct: same eid in,
- * same error/value out. */
-#define KEYSTONE_IOC_SINGLE_STEP \
-  _IOR(KEYSTONE_IOC_MAGIC, 0x08, struct keystone_ioctl_run_enclave)
 
 #define RT_NOEXEC 0
 #define USER_NOEXEC 1

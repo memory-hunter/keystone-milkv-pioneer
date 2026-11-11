@@ -31,6 +31,8 @@ extern struct miscdevice keystone_dev;
 long keystone_ioctl(struct file *filep, unsigned int cmd, unsigned long arg);
 int keystone_release(struct inode *inode, struct file *file);
 int keystone_mmap(struct file *filp, struct vm_area_struct *vma);
+int keystone_step_log_init(void);
+void keystone_step_log_exit(void);
 
 /* enclave private memory */
 struct epm {
@@ -56,7 +58,6 @@ struct enclave {
   struct utm *utm;
   struct epm *epm;
   bool is_init;
-  bool has_run; // set once sbi_sm_run_enclave() has been issued (single-step)
 };
 
 // global debug functions

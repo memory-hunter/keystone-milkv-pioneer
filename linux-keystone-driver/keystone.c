@@ -84,6 +84,15 @@ static int __init keystone_dev_init(void)
   if (ret < 0)
   {
     pr_err("keystone_enclave: misc_register() failed\n");
+    return ret;
+  }
+
+  ret = keystone_step_log_init();
+  if (ret < 0)
+  {
+    pr_err("keystone_step: misc_register() failed\n");
+    misc_deregister(&keystone_dev);
+    return ret;
   }
 
   keystone_dev.this_device->coherent_dma_mask = DMA_BIT_MASK(32);
@@ -95,6 +104,7 @@ static int __init keystone_dev_init(void)
 static void __exit keystone_dev_exit(void)
 {
   pr_info("keystone_enclave: keystone_dev_exit()\n");
+  keystone_step_log_exit();
   misc_deregister(&keystone_dev);
   return;
 }

@@ -44,6 +44,7 @@ set(OTHER_EXAMPLES
   cache-cntr
   rdcycle-rt
   rdcycle-direct
+  rsa-crt
 )
 
 # Selection logic

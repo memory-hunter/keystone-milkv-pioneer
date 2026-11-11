@@ -87,9 +87,7 @@ alloc_page(uintptr_t vpn, int flags) {
 
   /* if the page has been already allocated, return the page */
   if (*pte & PTE_V) {
-    printf(
-        "alloc_page: accessed. VA is: 0x%16lx\n",
-        __va(*pte << RISCV_PAGE_BITS));
+    // printf("alloc_page: accessed. VA is: 0x%16lx\n",__va(*pte << RISCV_PAGE_BITS));
     return __va(*pte << RISCV_PAGE_BITS);
   }
 
@@ -99,9 +97,9 @@ alloc_page(uintptr_t vpn, int flags) {
 
   *pte =
       pte_create(ppn(__pa(page)), PTE_D | PTE_A | PTE_V | flags | PTE_MT_ATTR);
-  uintptr_t mapped_va   = (vpn << RISCV_PAGE_BITS);
-  uintptr_t resolved_pa = translate(mapped_va);
-  printf("alloc_page: VA 0x%016lx -> PA 0x%016lx\n", mapped_va, resolved_pa);
+  // uintptr_t mapped_va   = (vpn << RISCV_PAGE_BITS);
+  // uintptr_t resolved_pa = translate(mapped_va);
+  // printf("alloc_page: VA 0x%016lx -> PA 0x%016lx\n", mapped_va, resolved_pa);
 #ifdef USE_PAGING
   paging_inc_user_page();
 #endif

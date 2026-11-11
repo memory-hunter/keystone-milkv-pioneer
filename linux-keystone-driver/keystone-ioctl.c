@@ -5,19 +5,24 @@
 #include "keystone-sbi.h"
 #include "keystone.h"
 #include "keystone_user.h"
+#include "keystone_step_rec.h"
+#include "sm_err.h"
 #include <asm/sbi.h>
 #include <linux/string.h>
 #include <linux/compiler.h>
 #include <linux/build_bug.h>
 #include <linux/irqflags.h>
-#include <linux/delay.h>
-#include <linux/sched.h>
+#include <linux/kfifo.h>
+#include <linux/miscdevice.h>
+#include <linux/poll.h>
 #include <linux/wait.h>
 #include <linux/atomic.h>
-#include <linux/completion.h>
-#include <linux/jiffies.h>
+#include <linux/delay.h>
+#include <linux/sched.h>
+#include <linux/uaccess.h>
+#include <linux/moduleparam.h>
 
-
+// opensbi calls
 #define SBI_CALL(___ext, ___which, ___arg0, ___arg1, ___arg2)    \
   ({                                                             \
     register uintptr_t a0 __asm__("a0") = (uintptr_t)(___arg0);  \
@@ -31,57 +36,12 @@
                      : "memory");                                \
     a0;                                                          \
   })
+#define SBI_CALL_1(___ext, ___which, ___arg0) SBI_CALL(___ext, ___which, ___arg0, 0, 0)
 
-  #define SBI_CALL_1(___ext, ___which, ___arg0) SBI_CALL(___ext, ___which, ___arg0, 0, 0)
-
-struct edge_return
-{
-  unsigned long call_status;
-  size_t call_ret_offset;
-  size_t call_ret_size;
-};
-struct edge_call
-{
-  unsigned long call_id;
-  size_t call_arg_offset;
-  size_t call_arg_size;
-  struct edge_return return_data;
-};
-
-#include <linux/uaccess.h>
-#include <linux/types.h>
-
-#define C920_L1D_WAYS 2U
-#define C920_L1D_SETS 512U
-#define C920_L1D_LINE_SIZE 64U
-
-#define C920_L1D_W 1
-#define C920_L1D_S 9
-#define C920_L1D_L 6
-
-#define C920_L1D_WAY_SHIFT (32 - C920_L1D_W)
-#define C920_L1D_SET_SHIFT C920_L1D_L
-#define C920_L1D_SET_MASK ((1UL << C920_L1D_S) - 1)
-
-#define TH_L1D_CALL asm volatile(".long 0x10000b" ::: "memory")
-#define TH_L1D_IALL asm volatile(".long 0x20000b" ::: "memory")
-#define TH_L1D_CIALL asm volatile(".long 0x30000b" ::: "memory")
-#define TH_L2_CALL asm volatile(".long 0x150000b" ::: "memory")
-#define TH_L2_IALL asm volatile(".long 0x160000b" ::: "memory")
-#define TH_L2_CIALL asm volatile(".long 0x170000b" ::: "memory")
+// THead asm stuff
 #define TH_SYNC_S asm volatile(".long 0x190000b" ::: "memory")
-
-#define TH_L1D_ISW_A0 asm volatile(".long 0x225000b" ::"r"(rs1) : "memory")
-#define TH_L1D_IVA_A0 asm volatile(".long 0x265000b" ::"r"(rs1) : "memory")
-#define TH_L1D_CIVA_A0 asm volatile(".long 0x275000b" ::"r"(rs1) : "memory")
 #define TH_L1D_IPA_A0 asm volatile(".long 0x2a5000b" ::"r"(rs1) : "memory")
 #define TH_L1D_CIPA_A0 asm volatile(".long 0x2b5000b" ::"r"(rs1) : "memory")
-
-#define TH_FLUSH_ALL \
-  TH_L1D_CIALL;      \
-  TH_SYNC_S;         \
-  TH_L2_CIALL;       \
-  TH_SYNC_S;
 
 static inline void th_l1d_ipa(unsigned long pa)
 {
@@ -99,262 +59,151 @@ static inline void th_l1d_cipa(unsigned long pa)
   TH_SYNC_S;
 }
 
-#include "sm_err.h"
-#include <linux/moduleparam.h>
+// constants
+#define TIMER_SET_ROUNDTRIP_TICKS 120
 
-/* --- targeted-strike state -------------------------------------------- */
-/* which enclave to strike, and the physical address of its target line.
- * set these however you determine the victim (e.g. from CREATE_ENCLAVE,
- * or hardcoded during experimentation). eid < 0 means "disabled". */
 static long strike_target_eid = -1;
 static unsigned long strike_target_pa = 0;
-static uint64_t strike_delta_ticks = 1; /* timebase ticks, not core cycles */
+static unsigned long strike_rip_start = 0;
+static unsigned long strike_rip_end = 0;
+static uint64_t strike_delta_ticks = 1;
+static int log_pc = 1;
 
-/* live-settable without reloading the module:
- *   echo <ticks> > /sys/module/keystone_driver/parameters/strike_delta_ticks
- *   echo <eid>   > /sys/module/keystone_driver/parameters/strike_target_eid
- *   echo <pa>    > /sys/module/keystone_driver/parameters/strike_target_pa
- * all three are read fresh from the global on each call, so a write
- * takes effect on the very next ioctl/loop iteration. eid = -1 disables
- * striking. strike_target_pa accepts hex (0x...) or decimal. */
-module_param(strike_delta_ticks, ullong, 0644);
+module_param(strike_target_eid, long, 0644);
 module_param(strike_target_pa, ulong, 0644);
-/* strike_target_eid itself is registered further down, after
- * step_tokens exists -- writing a new target also resets the token
- * counter, see strike_target_eid_set(). */
+module_param(strike_rip_start, ulong, 0644);
+module_param(strike_rip_end, ulong, 0644);
+module_param(strike_delta_ticks, ullong, 0644);
+module_param(log_pc, int, 0644);
 
-/* --- interactive single-step gate --------------------------------------
- * When step_mode is on, every SBI call keystone_strike_drive() makes for
- * the target enclave blocks until an external controller releases one
- * token -- instead of a separate process racing a duplicate ioctl call
- * against the enclave's own natural run/resume calls, we gate the call
- * the enclave's own host loader was always going to make anyway. Only
- * one thing ever drives the SBI calls, so there is no race.
- *
- * release one step from userspace:
- *   echo 1 > /sys/module/keystone_driver/parameters/step_go
- * watch results:
- *   dmesg -w | grep keystone-step
- */
-static int step_mode = 1; /* pause-by-default: on until told to turn off */
-module_param(step_mode, int, 0644);
+#define STEP_LOG_SIZE (1 << 24)
 
-static atomic_t step_tokens = ATOMIC_INIT(0);
+static DEFINE_KFIFO(step_fifo, u8, STEP_LOG_SIZE);
 static DECLARE_WAIT_QUEUE_HEAD(step_waitq);
+static atomic_t step_log_busy = ATOMIC_INIT(0);
+static unsigned long log_dropped = 0;
+module_param(log_dropped, ulong, 0444);
 
-/* Retargeting always clears any leftover tokens from a previous session
- * -- without this, tokens banked while nothing was consuming them (e.g.
- * against the wrong eid, or before the target launched) pile up and get
- * silently burned the moment a real match finally hits the gate, well
- * before your next deliberate release. */
-static int strike_target_eid_set(const char *val, const struct kernel_param *kp)
+static void step_log(u32 kind, u64 val, u32 err)
 {
-  int rc = param_ops_long.set(val, kp);
-  if (rc)
-    return rc;
-  atomic_set(&step_tokens, 0);
-  return 0;
-}
-static int strike_target_eid_get(char *buf, const struct kernel_param *kp)
-{
-  return param_ops_long.get(buf, kp);
-}
-static const struct kernel_param_ops strike_target_eid_ops = {
-  .set = strike_target_eid_set,
-  .get = strike_target_eid_get,
-};
-module_param_cb(strike_target_eid, &strike_target_eid_ops, &strike_target_eid, 0644);
+  struct step_rec rec = {.val = val, .kind = kind, .err = err};
 
-/* Signaled once per log_step() call (defined further down) -- makes each
- * *_go sysfs write synchronous: the write() doesn't return to userspace
- * until the step it requested has actually happened and
- * last_pc/last_error are fresh. This is what lets keystone-step
- * distinguish "a real step happened" from "nothing's listening yet" --
- * without it, a write just banks a token with no way to know whether
- * anything consumed it. */
-static DECLARE_COMPLETION(step_done);
-
-/* shared by step_go/ipa/cipa_go: release one token and block the
- * writer until the corresponding log_step() call completes. Timed out
- * (not infinite) so writing against a target that isn't actually paused
- * waiting (wrong eid, target not launched yet, step_mode off, ...) fails
- * with -ETIMEDOUT instead of hanging the calling process forever --
- * keystone-step turns that into "still waiting for eid=...", retrying. */
-static int release_token_and_wait_step(void)
-{
-  long ret;
-
-  atomic_inc(&step_tokens);
-  wake_up_interruptible(&step_waitq);
-
-  ret = wait_for_completion_interruptible_timeout(
-      &step_done, msecs_to_jiffies(5000));
-  if (ret == 0)
-    return -ETIMEDOUT;
-  if (ret < 0)
-    return (int)ret; /* -ERESTARTSYS from a signal */
-  return 0;
-}
-
-static int step_go_set(const char *val, const struct kernel_param *kp)
-{
-  return release_token_and_wait_step();
-}
-static int step_go_get(char *buf, const struct kernel_param *kp)
-{
-  return sprintf(buf, "%d\n", atomic_read(&step_tokens));
-}
-static const struct kernel_param_ops step_go_ops = {
-  .set = step_go_set,
-  .get = step_go_get,
-};
-module_param_cb(step_go, &step_go_ops, NULL, 0644);
-
-/* second gate: same token/wait mechanism as step_go, but strikes
- * strike_target_pa first -- lets userspace choose per-pause between
- * "just continue" (step_go) and "invalidate, then continue" (ipa). */
-static int ipa_set(const char *val, const struct kernel_param *kp)
-{
-  th_l1d_ipa(strike_target_pa);
-  return release_token_and_wait_step();
-}
-static int ipa_get(char *buf, const struct kernel_param *kp)
-{
-  return sprintf(buf, "%d\n", atomic_read(&step_tokens));
-}
-static const struct kernel_param_ops ipa_ops = {
-  .set = ipa_set,
-  .get = ipa_get,
-};
-module_param_cb(ipa, &ipa_ops, NULL, 0644);
-
-/* third gate: same mechanism again, but uses th_l1d_cipa() (clean +
- * invalidate) instead of th_l1d_ipa() (bare invalidate) -- commits the
- * line's current value to L2/memory first, then invalidates it, instead
- * of dropping whatever's dirty. Use this to deliberately pin down which
- * value becomes visible, rather than reverting to the stale one. */
-static int cipa_go_set(const char *val, const struct kernel_param *kp)
-{
-  th_l1d_cipa(strike_target_pa);
-  return release_token_and_wait_step();
-}
-static int cipa_go_get(char *buf, const struct kernel_param *kp)
-{
-  return sprintf(buf, "%d\n", atomic_read(&step_tokens));
-}
-static const struct kernel_param_ops cipa_go_ops = {
-  .set = cipa_go_set,
-  .get = cipa_go_get,
-};
-module_param_cb(cipa_go, &cipa_go_ops, NULL, 0644);
-
-static void step_wait_for_token(void)
-{
-  for (;;) {
-    if (wait_event_interruptible(step_waitq, atomic_read(&step_tokens) > 0))
-      return; /* interrupted -- don't hang a Ctrl-C'd process forever */
-    if (atomic_dec_if_positive(&step_tokens) >= 0)
-      return;
+  if (kfifo_avail(&step_fifo) < sizeof(rec))
+  {
+    log_dropped++;
+    return;
   }
+  kfifo_in(&step_fifo, (const u8 *)&rec, sizeof(rec));
+  wake_up_interruptible(&step_waitq);
 }
 
-/* last_seq/last_pc/last_error mirror the most recent log_step() call --
- * read-only sysfs so keystone-step can see the result of a step directly
- * instead of scraping dmesg text. */
-static unsigned long step_seq = 0;
-static unsigned long last_seq = 0;
-static unsigned long last_pc = 0;
-static unsigned long last_error = 0;
-module_param(last_seq, ulong, 0444);
-module_param(last_pc, ulong, 0444);
-module_param(last_error, ulong, 0444);
-
-/* OFF by default: at small strike_delta_ticks this fires on every
- * interrupt, potentially tens of thousands of times per second, and a
- * synchronous pr_info() at that rate can wedge the console/UART badly
- * enough to hang the whole machine. keystone-step doesn't need this --
- * it reads last_pc/last_error straight from sysfs. Turn it on only for
- * a low-rate/interactive run you actually want mirrored to dmesg:
- *   echo 1 > /sys/module/keystone_driver/parameters/step_log_dmesg */
-static int step_log_dmesg = 0;
-module_param(step_log_dmesg, int, 0644);
-
-static inline void log_step(unsigned long eid, struct sbiret ret)
+static int step_log_open(struct inode *inode, struct file *filp)
 {
-  last_seq = step_seq++;
-  last_error = (unsigned long)ret.error;
-  last_pc = (unsigned long)ret.value;
-
-  if (step_log_dmesg)
-    pr_info("keystone-step: seq=%lu eid=%lu error=%lu value=0x%lx\n",
-            last_seq, eid, last_error, last_pc);
-
-  complete(&step_done);
+  if (atomic_cmpxchg(&step_log_busy, 0, 1))
+    return -EBUSY;
+  kfifo_reset_out(&step_fifo);
+  log_dropped = 0;
+  return 0;
 }
 
-/* safety cap: max internal resumes per ioctl call, in case delta is
- * mis-tuned and every resume immediately re-triggers the timer */
-#define STRIKE_MAX_ATTEMPTS 100000
+static int step_log_release(struct inode *inode, struct file *filp)
+{
+  atomic_set(&step_log_busy, 0);
+  return 0;
+}
 
-/* Re-evaluated on every call rather than cached, specifically so that
- * resetting strike_target_eid from userspace (e.g. on quit) takes
- * effect immediately for an *in-flight* keystone_strike_drive() call,
- * not just future ones -- a cached is_target captured once at function
- * entry can't be un-targeted mid-loop no matter what you write to
- * sysfs afterward. */
+static ssize_t step_log_read(struct file *filp, char __user *buf, size_t count, loff_t *ppos)
+{
+  unsigned int copied;
+  int ret;
+
+  if (kfifo_is_empty(&step_fifo))
+  {
+    if (filp->f_flags & O_NONBLOCK)
+      return -EAGAIN;
+    ret = wait_event_interruptible(step_waitq, !kfifo_is_empty(&step_fifo));
+    if (ret)
+      return ret;
+  }
+
+  ret = kfifo_to_user(&step_fifo, buf, count, &copied);
+  return ret ? ret : copied;
+}
+
+static __poll_t step_log_poll(struct file *filp, poll_table *wait)
+{
+  poll_wait(filp, &step_waitq, wait);
+  return kfifo_is_empty(&step_fifo) ? 0 : EPOLLIN | EPOLLRDNORM;
+}
+
+static const struct file_operations step_log_fops = {
+    .owner = THIS_MODULE,
+    .open = step_log_open,
+    .release = step_log_release,
+    .read = step_log_read,
+    .poll = step_log_poll,
+};
+
+static struct miscdevice step_log_dev = {
+    .minor = MISC_DYNAMIC_MINOR,
+    .name = "keystone_step",
+    .fops = &step_log_fops,
+};
+
+int keystone_step_log_init(void)
+{
+  return misc_register(&step_log_dev);
+}
+
+void keystone_step_log_exit(void)
+{
+  misc_deregister(&step_log_dev);
+}
+
 static inline int strike_is_target(unsigned long ueid)
 {
-  return strike_target_eid >= 0 && ueid == strike_target_eid;
+  return strike_target_eid == -2 || (strike_target_eid >= 0 && ueid == strike_target_eid);
 }
 
-/* Enters via `entry` (sbi_sm_run_enclave for the very first call,
- * sbi_sm_resume_enclave for every call after) and, if targeted, arms the
- * timer before every single SBI call -- including the first -- then loops
- * internally on every stop caused by our own armed timer, striking each
- * time, until it hits a stop reason userspace actually understands (a
- * real ocall, or exit). Control never goes back to the ioctl caller in
- * between. If step_mode is on, each SBI call blocks on a token first.
- * ueid is the driver idr key (not the SM-internal eid), needed to
- * re-check targeting live -- see strike_is_target(). */
-static struct sbiret keystone_strike_drive(unsigned long eid,
-                                           unsigned long ueid,
-                                           struct sbiret (*entry)(unsigned long))
+static struct sbiret keystone_strike_drive(unsigned long eid, unsigned long ueid, struct sbiret (*entry)(unsigned long))
 {
-  unsigned long flags;
-  unsigned int attempts = 0;
   struct sbiret ret;
-  int is_target = strike_is_target(ueid);
 
-  if (is_target && step_mode)
-    step_wait_for_token();
-
-  if (is_target)
-    SBI_CALL_1(SBI_SET_TIMER, 0, get_cycles64() + strike_delta_ticks);
-
-  local_irq_save(flags);
-  ret = entry(eid);
-  local_irq_restore(flags);
-
-  if (is_target && step_mode)
-    log_step(eid, ret);
-
-  while (strike_is_target(ueid) &&
-         ret.error == SBI_ERR_SM_ENCLAVE_INTERRUPTED &&
-         attempts++ < STRIKE_MAX_ATTEMPTS)
+  if (!strike_is_target(ueid))
   {
-    /* invalidation disabled -- pure single-stepping only for now */
-    /* th_l1d_ipa(strike_target_pa); */
+    return entry(eid);
+  }
 
-    if (step_mode)
-      step_wait_for_token();
+  if (log_pc)
+    step_log(STEP_REC_START, ueid, 0);
 
-    SBI_CALL_1(SBI_SET_TIMER, 0, get_cycles64() + strike_delta_ticks);
-    local_irq_save(flags);
+  TH_SYNC_S;
+  SBI_CALL_1(SBI_SET_TIMER, 0, get_cycles() + TIMER_SET_ROUNDTRIP_TICKS + strike_delta_ticks);
+  ret = entry(eid);
+  TH_SYNC_S;
+
+  while (ret.error == SBI_ERR_SM_ENCLAVE_INTERRUPTED && strike_is_target(ueid))
+  {
+    unsigned long pc = (unsigned long)ret.value;
+
+    if (log_pc) {
+      step_log(STEP_REC_STEP, pc + 4, 0);
+    }
+
+    if (strike_target_pa)
+    {
+      if (strike_rip_end && pc >= strike_rip_start && pc <= strike_rip_end)
+        th_l1d_ipa(strike_target_pa);
+    }
+
+    TH_SYNC_S;
+    SBI_CALL_1(SBI_SET_TIMER, 0, get_cycles() + TIMER_SET_ROUNDTRIP_TICKS + strike_delta_ticks);
     ret = sbi_sm_resume_enclave(eid);
-    local_irq_restore(flags);
+    TH_SYNC_S;
+  }
 
-    if (step_mode)
-      log_step(eid, ret);
+  if (log_pc) {
+    step_log(STEP_REC_END, ret.value, (u32)ret.error);
   }
 
   return ret;
@@ -398,8 +247,6 @@ int keystone_create_enclave(struct file *filep, unsigned long arg)
 
   /* allocate UID */
   enclp->eid = enclave_idr_alloc(enclave);
-  pr_info("keystone: created enclave, driver eid = %lu (use this with keystone-step)\n",
-          (unsigned long)enclp->eid);
 
   filep->private_data = (void *)enclp->eid;
 
@@ -492,15 +339,7 @@ int keystone_run_enclave(unsigned long data)
     keystone_err("real enclave does not exist\n");
     return -EINVAL;
   }
-
-  pr_info("Enclave ID: %d", enclave->eid);
-
-  enclave->has_run = 1;
-  /* strike_target_eid is the driver idr key (ueid, printed as "driver
-   * eid = N") -- NOT enclave->eid, the SM's own internal enclave id, a
-   * completely separate number space. keystone_strike_drive() takes
-   * ueid directly now and re-checks targeting live on every iteration
-   * (see strike_is_target()), rather than a boolean cached once here. */
+  
   ret = keystone_strike_drive(enclave->eid, ueid, sbi_sm_run_enclave);
 
   arg->error = ret.error;
@@ -596,10 +435,6 @@ int __keystone_destroy_enclave(unsigned int ueid)
 int keystone_resume_enclave(unsigned long data)
 {
   struct sbiret ret;
-  ret.error = 0;
-  ret.value = 0;
-
-  //---------------
   struct keystone_ioctl_run_enclave *arg =
       (struct keystone_ioctl_run_enclave *)data;
   unsigned long ueid = arg->eid;
@@ -618,59 +453,7 @@ int keystone_resume_enclave(unsigned long data)
     return -EINVAL;
   }
 
-  struct edge_call *ec;
-  unsigned long id;
-
-  ec = (struct edge_call *)enclave->utm->ptr;
-  id = ec->call_id;
-
   ret = keystone_strike_drive(enclave->eid, ueid, sbi_sm_resume_enclave);
-
-  arg->error = ret.error;
-  arg->value = ret.value;
-
-  return 0;
-}
-
-/* single-step: exactly one strike_delta_ticks slice, then return
- * immediately to userspace regardless of why it stopped -- no internal
- * auto-loop like keystone_strike_drive(). Call this repeatedly (one call
- * per "step" input) to watch the enclave advance in delta-tick chunks. */
-int keystone_single_step_enclave(unsigned long data)
-{
-  struct sbiret ret;
-  struct keystone_ioctl_run_enclave *arg =
-      (struct keystone_ioctl_run_enclave *)data;
-  unsigned long ueid = arg->eid;
-  struct enclave *enclave;
-  unsigned long flags;
-
-  /* wait for an enclave with this eid to actually exist and be fully
-   * created on the SM side -- lets you launch the stepper *before* the
-   * target starts and catch it the moment it does, instead of racing
-   * to launch it after. just a poll loop, fine for experimentation;
-   * Ctrl-C (or any signal) breaks out cleanly via signal_pending(). */
-  while (!(enclave = get_enclave_by_id(ueid)) || enclave->eid < 0)
-  {
-    if (signal_pending(current))
-      return -EINTR;
-    msleep(20);
-  }
-
-  SBI_CALL_1(SBI_SET_TIMER, 0, get_cycles64() + strike_delta_ticks);
-
-  local_irq_save(flags);
-  if (!enclave->has_run) {
-    ret = sbi_sm_run_enclave(enclave->eid);
-    enclave->has_run = 1;
-  } else {
-    ret = sbi_sm_resume_enclave(enclave->eid);
-  }
-  local_irq_restore(flags);
-
-  /* invalidation disabled -- pure single-stepping only for now */
-  /* if (ret.error == SBI_ERR_SM_ENCLAVE_INTERRUPTED)
-    th_l1d_ipa(strike_target_pa); */
 
   arg->error = ret.error;
   arg->value = ret.value;
@@ -710,9 +493,6 @@ long keystone_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
     break;
   case KEYSTONE_IOC_RESUME_ENCLAVE:
     ret = keystone_resume_enclave((unsigned long)data);
-    break;
-  case KEYSTONE_IOC_SINGLE_STEP:
-    ret = keystone_single_step_enclave((unsigned long)data);
     break;
   case KEYSTONE_IOC_UTM_INIT:
     ret = utm_init_ioctl(filep, (unsigned long)data);
