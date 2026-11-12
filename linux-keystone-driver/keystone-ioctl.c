@@ -186,14 +186,17 @@ static struct sbiret keystone_strike_drive(unsigned long eid, unsigned long ueid
   {
     unsigned long pc = (unsigned long)ret.value;
 
-    if (log_pc) {
-      step_log(STEP_REC_STEP, pc + 4, 0);
+    if (log_pc)
+    {
+      step_log(STEP_REC_STEP, pc, 0);
     }
 
     if (strike_target_pa)
     {
       if (strike_rip_end && pc >= strike_rip_start && pc <= strike_rip_end)
+      {
         th_l1d_ipa(strike_target_pa);
+      }
     }
 
     TH_SYNC_S;
@@ -202,7 +205,8 @@ static struct sbiret keystone_strike_drive(unsigned long eid, unsigned long ueid
     TH_SYNC_S;
   }
 
-  if (log_pc) {
+  if (log_pc)
+  {
     step_log(STEP_REC_END, ret.value, (u32)ret.error);
   }
 
@@ -339,7 +343,7 @@ int keystone_run_enclave(unsigned long data)
     keystone_err("real enclave does not exist\n");
     return -EINVAL;
   }
-  
+
   ret = keystone_strike_drive(enclave->eid, ueid, sbi_sm_run_enclave);
 
   arg->error = ret.error;

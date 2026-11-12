@@ -94,7 +94,8 @@ static uint64_t modpow1(uint64_t base, uint64_t exp, uint64_t mod)
 KEEP_FUNCTION
 static uint64_t modpow2(uint64_t base, uint64_t exp, uint64_t mod)
 {
-	uint64_t res = 1;
+	volatile uint64_t res = 1;
+	ocall_print_value(&res);
 	base %= mod;
 
 	while (exp > 0)
@@ -156,10 +157,10 @@ static uint64_t modinv(uint64_t a, uint64_t m)
 int main(void)
 {
 
-	for (volatile int i = 0; i < 0xffff; i++)
-	{
-		i = i;
-	}
+	// for (volatile int i = 0; i < 0xffff; i++)
+	// {
+	// 	i = i;
+	// }
 
 	volatile uint64_t p = 61;
 	TH_SYNC_S;
@@ -167,63 +168,61 @@ int main(void)
 	TH_SYNC_S;
 	volatile uint64_t e = 17;
 	TH_SYNC_S;
-	volatile uint64_t N = p * q;
-	TH_SYNC_S;
-	volatile uint64_t phi = (p - 1) * (q - 1);
-	TH_SYNC_S;
-	volatile uint64_t d = modinv(e, phi);
-	TH_SYNC_S;
-	volatile uint64_t dp = d % (p - 1);
-	TH_SYNC_S;
-	volatile uint64_t dq = d % (q - 1);
-	TH_SYNC_S;
-	volatile uint64_t qinv = modinv(q, p);
 
-	// PRINT_STR("RSA parameters:\np = 61\nq = 53\n");
-
-	// ocall_print_value(N);	 // 3233
-	// ocall_print_value(phi);	 // 3120
-	// ocall_print_value(e);	 // 17
-	// ocall_print_value(d);	 // 2753
-	// ocall_print_value(dp);	 // 53
-	// ocall_print_value(dq);	 // 49
-	// ocall_print_value(qinv); // 38
+	// RSA key generation
+	volatile uint64_t N = p * q;                    // 3233
 	TH_SYNC_S;
-	// Sign
+	volatile uint64_t phi = (p - 1) * (q - 1);       // 3120
+	TH_SYNC_S;
+	volatile uint64_t d = modinv(e, phi);             // 2753
+	TH_SYNC_S;
+
+	// CRT private key parameters
+	volatile uint64_t dp = d % (p - 1);               // 53
+	TH_SYNC_S;
+	volatile uint64_t dq = d % (q - 1);               // 49
+	TH_SYNC_S;
+	volatile uint64_t qinv = modinv(q, p);             // 38
+	TH_SYNC_S;
+
+	// RSA parameters:
+	// p = 61, q = 53
+	// N = 3233, phi = 3120
+	// e = 17, d = 2753
+	// dp = 53, dq = 49, qinv = 38
+
+	// Sign message using CRT
 	volatile uint64_t m = 2;
-
-	TH_SYNC_S;
-	// PRINT_STR("Doing sp\n");
-	volatile uint64_t sp = modpow1(m, dp, p); // 8
-
-	TH_SYNC_S;
-	// PRINT_STR("Doing sq\n");
-	volatile uint64_t sq = modpow2(m, dq, q); // 30
-
-	// ocall_print_value(sp); // 8
-	// ocall_print_value(sq); // 30
 	TH_SYNC_S;
 
-	volatile uint64_t h = (qinv * ((sp + p - sq) % p)) % p;
-	// ocall_print_value(h); // 13
-
+	// First CRT exponentiation: sp = m^dp mod p
+	volatile uint64_t sp = modpow1(m, dp, p);          // 51
 	TH_SYNC_S;
 
-	volatile uint64_t s = sq + h * q;
-	// ocall_print_value(s); // 719
-
+	// Second CRT exponentiation: sq = m^dq mod q
+	volatile uint64_t sq = modpow2(m, dq, q);          // 20
 	TH_SYNC_S;
 
-	// PRINT_STR("Signing details:\n");
-	// ocall_print_value(m); // 2
+	ocall_print_value(sp);                             // 51
+	ocall_print_value(sq);                             // 30
 
-	// Verify
-	volatile uint64_t verified = modpow3(s, e, N);
-
+	// CRT recombination
+	// h = qinv * (sp - sq) mod p
+	volatile uint64_t h =
+		(qinv * ((sp + p - sq) % p)) % p;              // 6
 	TH_SYNC_S;
 
-	// PRINT_STR("Verification result:\n");
-	// ocall_print_value(verified); // 2
+	// Reconstruct RSA signature
+	// s = sq + h * q
+	volatile uint64_t s = sq + h * q;                 // 348
+	TH_SYNC_S;
+
+	// Verify signature: m' = s^e mod N
+	volatile uint64_t verify = modpow3(s, e, N);       // 2
+	TH_SYNC_S;
+
+	PRINT_STR("Verification result:\n");
+	ocall_print_value(verify); // 2
 
 	EAPP_RETURN(0);
 }

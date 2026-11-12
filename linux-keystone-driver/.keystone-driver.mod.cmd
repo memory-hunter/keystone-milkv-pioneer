@@ -1,1 +1,0 @@
-savedcmd_/home/dpetriashvili/keystone-milkv-pioneer/linux-keystone-driver/keystone-driver.mod := printf '%s\n'   keystone.o keystone-page.o keystone-ioctl.o keystone-enclave.o keystone-sbi.o | awk '!x[$$0]++ { print("/home/dpetriashvili/keystone-milkv-pioneer/linux-keystone-driver/"$$0) }' > /home/dpetriashvili/keystone-milkv-pioneer/linux-keystone-driver/keystone-driver.mod

@@ -1,1 +1,0 @@
-savedcmd_/home/dpetriashvili/keystone-milkv-pioneer/linux-keystone-driver/Module.symvers :=  scripts/mod/modpost -M -m       -o /home/dpetriashvili/keystone-milkv-pioneer/linux-keystone-driver/Module.symvers -T /home/dpetriashvili/keystone-milkv-pioneer/linux-keystone-driver/modules.order -i Module.symvers -e 

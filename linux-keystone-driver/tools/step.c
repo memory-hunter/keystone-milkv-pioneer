@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdarg.h>
 
 #include "../keystone_step_rec.h"
 
@@ -15,7 +16,7 @@
 #define LOG_DEV "/dev/keystone_step"
 
 static int
-write_param(const char *name, long value)
+write_param_raw(const char *name, const char *fmt, ...)
 {
   char path[256];
   snprintf(path, sizeof(path), PARAM_DIR "%s", name);
@@ -26,12 +27,34 @@ write_param(const char *name, long value)
     fprintf(stderr, "(is the keystone-driver module loaded? are you root?)\n");
     return -1;
   }
-  int rc = fprintf(f, "%ld\n", value) < 0 ? -1 : 0;
+
+  va_list args;
+  va_start(args, fmt);
+  int rc = vfprintf(f, fmt, args) < 0 ? -1 : 0;
+  va_end(args);
+
   if (fclose(f))
     rc = -1;
   if (rc)
     fprintf(stderr, "%s: write failed: %s\n", path, strerror(errno));
   return rc;
+}
+
+/* for signed module params (strike_target_eid uses -1/-2 sentinels) */
+static int
+write_param(const char *name, long value)
+{
+  return write_param_raw(name, "%ld\n", value);
+}
+
+/* for unsigned module params (strike_target_pa, strike_rip_start/end):
+ * writing a negative decimal string to a `ulong`/`ullong` module param
+ * makes kstrtoul() reject it with EINVAL, so addresses with the top bit
+ * set (e.g. 0xc0000001...) must go through here, not write_param(). */
+static int
+write_param_u(const char *name, unsigned long value)
+{
+  return write_param_raw(name, "%lu\n", value);
 }
 
 static void
@@ -231,9 +254,9 @@ main(int argc, char **argv)
   }
 
   if ((delta_ticks >= 0 && write_param("strike_delta_ticks", delta_ticks)) ||
-      write_param("strike_target_pa", has_pa ? (long)pa : 0) ||
-      write_param("strike_rip_start", (long)rip_start) ||
-      write_param("strike_rip_end", (long)rip_end) ||
+      write_param_u("strike_target_pa", has_pa ? pa : 0) ||
+      write_param_u("strike_rip_start", rip_start) ||
+      write_param_u("strike_rip_end", rip_end) ||
       write_param("log_pc", log_pc) ||
       write_param("strike_target_eid", driver_enclave_id)) {
     disarm();
